@@ -200,6 +200,10 @@ class BenchmarkRunner:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
         self.results = []
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(exist_ok=True)
+        self.json_output_dir = self.output_dir / "output"
+        self.json_output_dir.mkdir(exist_ok=True)
     
     def _load_test_cases(self) -> List[TestCase]:
         """Load test cases from individual YAML files."""
@@ -285,7 +289,11 @@ class BenchmarkRunner:
         
         # Get AI response via OpenRouter
         response = await client.generate_response(model_config, test_case)
-        
+        json_filename = f"{test_case.id}_{model_config.name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        json_filepath = self.json_output_dir / json_filename
+        with open(json_filepath, 'w') as f:
+            f.write(response)
+            
         # Extract JSON from response (AI might add explanations)
         json_response = self._extract_json(response)
         
