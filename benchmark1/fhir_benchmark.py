@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Dict, List, Any, Optional
 from dataclasses import dataclass, asdict
 import aiohttp
+import ssl
+import certifi
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
@@ -134,8 +136,11 @@ class OpenRouterClient:
         self.session = None
     
     async def __aenter__(self):
-        """Create HTTP session."""
-        self.session = aiohttp.ClientSession()
+        """Create HTTP session with proper SSL context."""
+        # Create proper SSL context for macOS certificate issues
+        ssl_context = ssl.create_default_context(cafile=certifi.where())
+        connector = aiohttp.TCPConnector(ssl=ssl_context)
+        self.session = aiohttp.ClientSession(connector=connector)
         return self
     
     async def __aexit__(self, exc_type, exc_val, exc_tb):
