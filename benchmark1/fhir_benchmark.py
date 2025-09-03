@@ -60,14 +60,15 @@ class TestResult:
 class FHIRValidator:
     """Wrapper for FHIR validator MCP."""
     
-    def __init__(self, mcp_server_path: str = "npx @aehrc/mcp-fhir-tools"):
-        self.server_path = mcp_server_path
+    def __init__(self, mcp_server_path: str = "npx mcp-fhir-tools"):
+        self.server_path = mcp_server_path.split()
         self.session = None
     
     async def __aenter__(self):
         """Async context manager entry."""
         server_params = StdioServerParameters(
-            command=self.server_path.split(),
+            command=self.server_path[0],  # Pass as string, not list
+            args=self.server_path[1:],
             env=None
         )
         
@@ -624,7 +625,7 @@ async def main():
     # Initialize benchmark runner
     runner = BenchmarkRunner(
         tests_dir="tests",
-        models_file="config/models.yaml",
+        models_file="models.yaml",
         openrouter_api_key=openrouter_api_key,
         output_dir="results"
     )
