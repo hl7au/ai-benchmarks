@@ -72,7 +72,18 @@ class FHIRValidator:
             env=None
         )
         
-        self.session = await stdio_client(server_params).__aenter__()
+        # Correct pattern:
+        # 1. Create stdio client context manager
+        self.stdio_client = stdio_client(server_params)
+        read_stream, write_stream = await self.stdio_client.__aenter__()
+
+        # 2. Create session with the streams  
+        self.session = ClientSession(read_stream, write_stream)
+        await self.session.__aenter__()
+
+        # 3. Initialize the connection
+        await self.session.initialize()
+        
         return self
     
     async def __aexit__(self, exc_type, exc_val, exc_tb):
