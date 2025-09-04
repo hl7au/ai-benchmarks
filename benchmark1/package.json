@@ -1,0 +1,53 @@
+{
+  "name": "fhir-ai-benchmark",
+  "version": "1.0.0",
+  "description": "A TypeScript framework for benchmarking AI models on FHIR resource generation tasks",
+  "type": "module",
+  "main": "dist/fhir_benchmark.js",
+  "bin": {
+    "fhir-benchmark": "dist/fhir_benchmark.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx fhir_benchmark.ts",
+    "start": "node dist/fhir_benchmark.js",
+    "benchmark": "tsx fhir_benchmark.ts",
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "clean": "rimraf dist",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "fhir",
+    "ai",
+    "benchmark",
+    "healthcare",
+    "typescript",
+    "openrouter",
+    "validation"
+  ],
+  "author": "Your Name <your.email@example.com>",
+  "license": "MIT",
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "fhir-validator-wrapper": "^1.1.0",
+    "node-fetch": "^3.3.2",
+    "yaml": "^2.4.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.7",
+    "rimraf": "^5.0.5",
+    "tsx": "^4.7.2",
+    "typescript": "^5.4.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/your-org/fhir-ai-benchmark.git"
+  },
+  "bugs": {
+    "url": "https://github.com/your-org/fhir-ai-benchmark/issues"
+  },
+  "homepage": "https://github.com/your-org/fhir-ai-benchmark#readme"
+}

@@ -1,0 +1,9 @@
+validatorJarPath: "/path/to/validator_cli.jar"
+version: "5.0.0"
+txServer: "http://tx.fhir.org/r5"
+txLog: "./tx-log.txt"
+igs:
+  - "hl7.fhir.au.ps#current"
+  - "hl7.fhir.uv.ipa#1.0.0"
+port: 8080
+timeout: 30000

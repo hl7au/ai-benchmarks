@@ -7,6 +7,7 @@ prompt: |
 expected_resource_type: "Bundle"
 category: "patient_summary"
 difficulty: "hard"
+profile: http://hl7.org.au/fhir/ps/StructureDefinition/au-ps-bundle
 scoring_criteria:
   fhir_validity: 0.3
   resource_type: 0.1
