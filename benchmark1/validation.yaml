@@ -1,4 +1,4 @@
-validatorJarPath: "/path/to/validator_cli.jar"
+validatorJarPath: "../../validator_cli.jar"
 version: "5.0.0"
 txServer: "http://tx.fhir.org/r5"
 txLog: "./tx-log.txt"

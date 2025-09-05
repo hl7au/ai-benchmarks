@@ -3,16 +3,15 @@
 /**
  * FHIR AI Benchmark Framework - TypeScript Version
  * A tool for evaluating AI models on FHIR resource generation tasks using OpenRouter.
+ * Uses fhir-validator-wrapper for FHIR validation.
  */
 
 import fs from 'fs/promises';
 import path from 'path';
-import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 import yaml from 'yaml';
 import fetch from 'node-fetch';
-import { createWriteStream } from 'fs';
-import { promisify } from 'util';
+import FhirValidator from 'fhir-validator-wrapper';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -25,6 +24,7 @@ interface TestCase {
   system_prompt: string;
   prompt: string;
   expected_resource_type?: string;
+  profile?: string; // FHIR profile to validate against
   category: string;
   difficulty: string;
   scoring_criteria: Record<string, number>;
@@ -43,7 +43,7 @@ interface TestResult {
   test_id: string;
   model_name: string;
   response: string;
-  fhir_validation: Record<string, any>;
+  fhir_validation: FHIRValidationResult;
   scores: Record<string, number>;
   total_score: number;
   execution_time: number;
@@ -56,20 +56,17 @@ interface FHIRValidationResult {
   errors: string[];
   warnings: string[];
   resource_type: string;
+  issues?: any[]; // Full validation issues from OperationOutcome
 }
 
-interface MCPMessage {
-  jsonrpc: string;
-  id: number;
-  method: string;
-  params?: any;
-}
-
-interface MCPResponse {
-  jsonrpc: string;
-  id: number;
-  result?: any;
-  error?: any;
+interface ValidationConfig {
+  validatorJarPath: string;
+  version: string;
+  txServer: string;
+  txLog: string;
+  igs?: string[];
+  port?: number;
+  timeout?: number;
 }
 
 class Logger {
@@ -86,135 +83,6 @@ class Logger {
   }
 }
 
-class FHIRValidator {
-  private mcpProcess: any = null;
-  private messageId = 0;
-  private pendingRequests = new Map<number, { resolve: Function; reject: Function }>();
-
-  constructor(private serverCommand: string = "npx mcp-fhir-tools") {}
-
-  async initialize(): Promise<void> {
-    // Split command into parts
-    const commandParts = this.serverCommand.split(' ');
-    const cmd = commandParts[0];
-    const args = commandParts.slice(1);
-
-    // Spawn MCP server process
-    this.mcpProcess = spawn(cmd, args, {
-      stdio: ['pipe', 'pipe', 'pipe']
-    });
-
-    // Handle stdout messages
-    this.mcpProcess.stdout.on('data', (data: Buffer) => {
-      const lines = data.toString().split('\n').filter(line => line.trim());
-      for (const line of lines) {
-        try {
-          const response: MCPResponse = JSON.parse(line);
-          const pending = this.pendingRequests.get(response.id);
-          if (pending) {
-            this.pendingRequests.delete(response.id);
-            if (response.error) {
-              pending.reject(new Error(response.error.message || 'MCP Error'));
-            } else {
-              pending.resolve(response.result);
-            }
-          }
-        } catch (e) {
-          // Ignore non-JSON lines
-        }
-      }
-    });
-
-    // Handle stderr
-    this.mcpProcess.stderr.on('data', (data: Buffer) => {
-      Logger.error(`MCP Server Error: ${data.toString()}`);
-    });
-
-    // Initialize the MCP connection
-    await this.sendMessage('initialize', {
-      protocolVersion: '2024-11-05',
-      capabilities: {},
-      clientInfo: {
-        name: 'fhir-benchmark',
-        version: '1.0.0'
-      }
-    });
-  }
-
-  async cleanup(): Promise<void> {
-    if (this.mcpProcess) {
-      this.mcpProcess.kill();
-      this.mcpProcess = null;
-    }
-  }
-
-  private async sendMessage(method: string, params?: any): Promise<any> {
-    if (!this.mcpProcess) {
-      throw new Error('MCP process not initialized');
-    }
-
-    const id = ++this.messageId;
-    const message: MCPMessage = {
-      jsonrpc: '2.0',
-      id,
-      method,
-      ...(params && { params })
-    };
-
-    return new Promise((resolve, reject) => {
-      this.pendingRequests.set(id, { resolve, reject });
-
-      this.mcpProcess.stdin.write(JSON.stringify(message) + '\n');
-
-      // Set timeout
-      setTimeout(() => {
-        if (this.pendingRequests.has(id)) {
-          this.pendingRequests.delete(id);
-          reject(new Error('MCP request timeout'));
-        }
-      }, 10000);
-    });
-  }
-
-  async validateResource(fhirJson: string): Promise<FHIRValidationResult> {
-    try {
-      // Parse JSON to ensure it's valid
-      const resource = JSON.parse(fhirJson);
-
-      // Call FHIR validator via MCP
-      const result = await this.sendMessage('tools/call', {
-        name: 'validate_resource',
-        arguments: { resource }
-      });
-
-      return {
-        valid: result?.valid || false,
-        errors: result?.errors || [],
-        warnings: result?.warnings || [],
-        resource_type: resource?.resourceType || 'unknown'
-      };
-
-    } catch (e) {
-      if (e instanceof SyntaxError) {
-        return {
-          valid: false,
-          errors: [`Invalid JSON: ${e.message}`],
-          warnings: [],
-          resource_type: 'unknown'
-        };
-      }
-
-      Logger.error(`Validation error: ${e}`);
-      return {
-        valid: false,
-        errors: [`Validation failed: ${e}`],
-        warnings: [],
-        resource_type: 'unknown'
-      };
-    }
-  }
-}
-
 class OpenRouterClient {
   private baseUrl = "https://openrouter.ai/api/v1/chat/completions";
 
@@ -224,7 +92,7 @@ class OpenRouterClient {
     const headers = {
       "Authorization": `Bearer ${this.apiKey}`,
       "Content-Type": "application/json",
-      "HTTP-Referer": "https://github.com/your-org/benchmark1", // Replace with your repo
+      "HTTP-Referer": "https://github.com/your-org/benchmark1",
       "X-Title": "FHIR AI Benchmark"
     };
 
@@ -274,15 +142,18 @@ class BenchmarkRunner {
   private outputDir: string;
   private jsonOutputDir: string;
   private results: TestResult[] = [];
+  private validationConfig: ValidationConfig;
+  private validator: FhirValidator;
 
   constructor(
       private testsDir: string,
       private modelsFile: string,
+      private validationConfigFile: string,
       private openrouterApiKey: string,
       outputDir: string = "results"
   ) {
-    this.outputDir = outputDir;
-    this.jsonOutputDir = path.join(outputDir, "output");
+    this.outputDir = path.resolve(outputDir);
+    this.jsonOutputDir = path.join(this.outputDir, "output");
   }
 
   async initialize(): Promise<void> {
@@ -290,9 +161,31 @@ class BenchmarkRunner {
     await fs.mkdir(this.outputDir, { recursive: true });
     await fs.mkdir(this.jsonOutputDir, { recursive: true });
 
-    // Load test cases and models
+    // Load configurations
     this.testCases = await this.loadTestCases();
     this.models = await this.loadModels();
+    this.validationConfig = await this.loadValidationConfig();
+
+    // Initialize FHIR validator
+    this.validator = new FhirValidator(this.validationConfig.validatorJarPath);
+
+    Logger.info("Starting FHIR validator service...");
+    await this.validator.start({
+      version: this.validationConfig.version,
+      txServer: this.validationConfig.txServer,
+      txLog: this.validationConfig.txLog,
+      igs: this.validationConfig.igs || [],
+      port: this.validationConfig.port || 8080,
+      timeout: this.validationConfig.timeout || 30000
+    });
+    Logger.info("FHIR validator service started successfully");
+  }
+
+  async cleanup(): Promise<void> {
+    if (this.validator) {
+      Logger.info("Stopping FHIR validator service...");
+      await this.validator.stop();
+    }
   }
 
   private async loadTestCases(): Promise<TestCase[]> {
@@ -352,15 +245,23 @@ class BenchmarkRunner {
     }));
   }
 
+  private async loadValidationConfig(): Promise<ValidationConfig> {
+    const content = await fs.readFile(this.validationConfigFile, 'utf-8');
+    const data = yaml.parse(content);
+
+    return {
+      port: 8080,
+      timeout: 30000,
+      ...data
+    };
+  }
+
   async runBenchmark(): Promise<void> {
     Logger.info(`Starting benchmark with ${this.testCases.length} tests and ${this.models.length} models`);
 
     const openrouterClient = new OpenRouterClient(this.openrouterApiKey);
-    const validator = new FHIRValidator();
 
     try {
-      await validator.initialize();
-
       for (const modelConfig of this.models) {
         Logger.info(`Testing model: ${modelConfig.name} (${modelConfig.model_id})`);
 
@@ -369,8 +270,7 @@ class BenchmarkRunner {
             const result = await this.runSingleTest(
                 openrouterClient,
                 modelConfig,
-                testCase,
-                validator
+                testCase
             );
             this.results.push(result);
             Logger.info(`✅ ${modelConfig.name} - ${testCase.id}: ${result.total_score.toFixed(2)}`);
@@ -384,7 +284,12 @@ class BenchmarkRunner {
               test_id: testCase.id,
               model_name: modelConfig.name,
               response: "",
-              fhir_validation: {},
+              fhir_validation: {
+                valid: false,
+                errors: [String(error)],
+                warnings: [],
+                resource_type: 'unknown'
+              },
               scores: {},
               total_score: 0.0,
               execution_time: 0.0,
@@ -396,7 +301,7 @@ class BenchmarkRunner {
         }
       }
     } finally {
-      await validator.cleanup();
+      await this.cleanup();
     }
 
     // Generate reports
@@ -406,8 +311,7 @@ class BenchmarkRunner {
   private async runSingleTest(
       client: OpenRouterClient,
       modelConfig: ModelConfig,
-      testCase: TestCase,
-      validator: FHIRValidator
+      testCase: TestCase
   ): Promise<TestResult> {
     const startTime = Date.now();
 
@@ -422,8 +326,8 @@ class BenchmarkRunner {
     // Extract JSON from response (AI might add explanations)
     const jsonResponse = this.extractJson(response);
 
-    // Validate FHIR
-    const validationResult = await validator.validateResource(jsonResponse);
+    // Validate FHIR using fhir-validator-wrapper
+    const validationResult = await this.validateFhirResource(jsonResponse, testCase.profile);
 
     // Calculate scores
     const scores = this.calculateScores(testCase, jsonResponse, validationResult);
@@ -444,6 +348,70 @@ class BenchmarkRunner {
       execution_time: executionTime,
       timestamp: new Date()
     };
+  }
+
+  private async validateFhirResource(fhirJson: string, profile?: string): Promise<FHIRValidationResult> {
+    try {
+      // Parse JSON to ensure it's valid and get resource type
+      const resource = JSON.parse(fhirJson);
+      const resourceType = resource?.resourceType || 'unknown';
+
+      // Build validation options for the fhir-validator-wrapper
+      const validationOptions: any = {
+        anyExtensionsAllowed: true
+      };
+
+      // Add profile if specified
+      if (profile) {
+        validationOptions.profiles = [profile];
+      }
+
+      // Call the fhir-validator-wrapper's validate method
+      const operationOutcome = await this.validator.validate(fhirJson, validationOptions);
+
+      // Process OperationOutcome to extract validation info
+      const issues = operationOutcome?.issue || [];
+      const errors: string[] = [];
+      const warnings: string[] = [];
+
+      for (const issue of issues) {
+        const message = issue.diagnostics || issue.details?.text || 'Unknown issue';
+
+        if (issue.severity === 'error' || issue.severity === 'fatal') {
+          errors.push(message);
+        } else if (issue.severity === 'warning') {
+          warnings.push(message);
+        }
+      }
+
+      const valid = errors.length === 0;
+
+      return {
+        valid,
+        errors,
+        warnings,
+        resource_type: resourceType,
+        issues
+      };
+
+    } catch (e) {
+      if (e instanceof SyntaxError) {
+        return {
+          valid: false,
+          errors: [`Invalid JSON: ${e.message}`],
+          warnings: [],
+          resource_type: 'unknown'
+        };
+      }
+
+      Logger.error(`Validation error: ${e}`);
+      return {
+        valid: false,
+        errors: [`Validation failed: ${e}`],
+        warnings: [],
+        resource_type: 'unknown'
+      };
+    }
   }
 
   private extractJson(response: string): string {
@@ -483,7 +451,7 @@ class BenchmarkRunner {
   private calculateScores(
       testCase: TestCase,
       response: string,
-      validation: Record<string, any>
+      validation: FHIRValidationResult
   ): Record<string, number> {
     const scores: Record<string, number> = {};
 
@@ -500,8 +468,8 @@ class BenchmarkRunner {
     }
 
     // Error severity scoring
-    const errorCount = (validation.errors || []).length;
-    const warningCount = (validation.warnings || []).length;
+    const errorCount = validation.errors.length;
+    const warningCount = validation.warnings.length;
     scores.error_severity = Math.max(0.0, 1.0 - (errorCount * 0.2 + warningCount * 0.1));
 
     // Response completeness (basic heuristic based on JSON structure)
@@ -545,26 +513,6 @@ class BenchmarkRunner {
     // Generate HTML report
     const htmlOutput = path.join(this.outputDir, "benchmark_report.html");
     await this.generateHtmlReport(htmlOutput, summary);
-
-    // Generate latest symlinks for easy access (only on Unix-like systems)
-    const latestJson = path.join(this.outputDir, "latest_results.json");
-    const latestSummary = path.join(this.outputDir, "latest_summary.json");
-
-    try {
-      // Remove existing symlinks and create new ones
-      try {
-        await fs.unlink(latestJson);
-      } catch {}
-      try {
-        await fs.unlink(latestSummary);
-      } catch {}
-
-      await fs.symlink(path.basename(jsonOutput), latestJson);
-      await fs.symlink(path.basename(summaryOutput), latestSummary);
-    } catch (symlinkError) {
-      // Symlinks might not be supported on all systems, just log and continue
-      Logger.info(`Could not create symlinks: ${symlinkError}`);
-    }
 
     Logger.info(`Reports generated: ${htmlOutput}`);
     Logger.info(`Raw results: ${jsonOutput}`);
@@ -663,12 +611,12 @@ class BenchmarkRunner {
 <body>
     <div class="container">
         <div class="header">
-            <h1>🏥 FHIR AI Benchmark Results</h1>
+            <h1>FHIR AI Benchmark Results</h1>
             <p><strong>Generated:</strong> ${summary.run_timestamp}</p>
             <p><strong>Total Tests:</strong> ${summary.total_tests} | <strong>Models:</strong> ${Object.keys(summary.models).length}</p>
         </div>
         
-        <h2>📊 Model Performance Leaderboard</h2>
+        <h2>Model Performance Leaderboard</h2>
         <table>
             <tr>
                 <th>Rank</th>
@@ -682,7 +630,7 @@ class BenchmarkRunner {
 ${this.generateModelTable(summary)}
         </table>
         
-        <h2>🧪 Test Case Performance</h2>
+        <h2>Test Case Performance</h2>
         <table>
             <tr>
                 <th>Test Case</th>
@@ -693,7 +641,7 @@ ${this.generateModelTable(summary)}
 ${this.generateTestCaseTable(summary)}
         </table>
         
-        <h2>🔍 Detailed Results by Model</h2>
+        <h2>Detailed Results by Model</h2>
 ${this.generateDetailedResults(summary)}
         
         <footer style="margin-top: 40px; padding-top: 20px; border-top: 1px solid #eee; color: #666;">
@@ -760,7 +708,7 @@ ${this.generateDetailedResults(summary)}
         } else {
           statusCell = '<span class="success">✅ Success</span>';
           validIcon = result.fhir_validation?.valid ? "✅" : "❌";
-          errorCount = String((result.fhir_validation?.errors || []).length);
+          errorCount = String(result.fhir_validation?.errors?.length || 0);
         }
 
         return `
@@ -775,7 +723,7 @@ ${this.generateDetailedResults(summary)}
 
       return `
         <div class="model-card">
-            <h3>🤖 ${modelName}</h3>
+            <h3>${modelName}</h3>
             <div class="metric">
                 <div class="metric-value score">${stats.avg_score.toFixed(3)}</div>
                 <div class="metric-label">Average Score</div>
@@ -805,30 +753,62 @@ ${tableRows}
 }
 
 async function main(): Promise<void> {
-  // Load environment variables (you'll need to install dotenv)
-  const { config } = await import('dotenv');
-  config();
+  try {
+    // Load environment variables - try multiple approaches
+    try {
+      const { config } = await import('dotenv');
+      config();
+    } catch (dotenvError) {
+      Logger.info("dotenv not available, checking process.env directly");
+    }
 
-  const openrouterApiKey = process.env.OPENROUTER_API_KEY;
-  if (!openrouterApiKey) {
-    throw new Error("OPENROUTER_API_KEY environment variable not set");
+    // Check for API key in multiple ways
+    let openrouterApiKey = process.env.OPENROUTER_API_KEY;
+
+    // If not found, try reading .env file manually
+    if (!openrouterApiKey) {
+      try {
+        const envContent = await fs.readFile('.env', 'utf-8');
+        const envLines = envContent.split('\n');
+        for (const line of envLines) {
+          if (line.startsWith('OPENROUTER_API_KEY=')) {
+            openrouterApiKey = line.split('=')[1].trim();
+            break;
+          }
+        }
+      } catch (envError) {
+        Logger.error("Could not read .env file");
+      }
+    }
+
+    if (!openrouterApiKey) {
+      throw new Error(`OPENROUTER_API_KEY environment variable not set. 
+Current env keys: ${Object.keys(process.env).filter(k => k.includes('ROUTER')).join(', ')}
+Please set the environment variable or create a .env file with:
+OPENROUTER_API_KEY=your_api_key_here`);
+    }
+
+    Logger.info(`API key loaded: ${openrouterApiKey.substring(0, 12)}...`);
+
+    // Initialize benchmark runner
+    const runner = new BenchmarkRunner(
+        "tests",
+        "models.yaml",
+        "validation.yaml",
+        openrouterApiKey,
+        "results"
+    );
+
+    await runner.initialize();
+
+    // Run benchmark
+    await runner.runBenchmark();
+
+    console.log("Benchmark completed! Check the results directory for reports.");
+  } catch (error) {
+    Logger.error(`Failed to run benchmark: ${error}`);
+    process.exit(1);
   }
-
-  // Initialize benchmark runner
-  const runner = new BenchmarkRunner(
-      "tests",
-      "models.yaml",
-      "validation.yaml",
-      openrouterApiKey,
-      "results"
-  );
-
-  await runner.initialize();
-
-  // Run benchmark
-  await runner.runBenchmark();
-
-  console.log("Benchmark completed! Check the results directory for reports.");
 }
 
 // Run if this is the main module
