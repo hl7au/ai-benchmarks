@@ -140,7 +140,6 @@ class BenchmarkRunner {
   private testCases: TestCase[];
   private models: ModelConfig[];
   private outputDir: string;
-  private jsonOutputDir: string;
   private results: TestResult[] = [];
   private validationConfig: ValidationConfig;
   private validator: FhirValidator;
@@ -152,14 +151,14 @@ class BenchmarkRunner {
       private openrouterApiKey: string,
       outputDir: string = "results"
   ) {
-    this.outputDir = path.resolve(outputDir);
-    this.jsonOutputDir = path.join(this.outputDir, "output");
+    const runTimestamp = new Date().toISOString().replace(/[T\-:.]/g, '').substring(0, 14); // yyyymmddhhnnss
+    this.outputDir = path.resolve(path.join(outputDir, runTimestamp));
+    console.log("Output in "+this.outputDir);
   }
 
   async initialize(): Promise<void> {
-    // Create output directories
+    // Create output directory
     await fs.mkdir(this.outputDir, { recursive: true });
-    await fs.mkdir(this.jsonOutputDir, { recursive: true });
 
     // Load configurations
     this.testCases = await this.loadTestCases();
@@ -169,7 +168,7 @@ class BenchmarkRunner {
     // Initialize FHIR validator
     this.validator = new FhirValidator(this.validationConfig.validatorJarPath);
 
-    Logger.info("Starting FHIR validator service...");
+    // Logger.info("Starting FHIR validator service...");
     await this.validator.start({
       version: this.validationConfig.version,
       txServer: this.validationConfig.txServer,
@@ -178,7 +177,7 @@ class BenchmarkRunner {
       port: this.validationConfig.port || 8080,
       timeout: this.validationConfig.timeout || 30000
     });
-    Logger.info("FHIR validator service started successfully");
+    // Logger.info("FHIR validator service started successfully");
   }
 
   async cleanup(): Promise<void> {
@@ -220,7 +219,7 @@ class BenchmarkRunner {
           };
 
           testCases.push(testCase);
-          Logger.info(`Loaded test case: ${testId}`);
+          // Logger.info(`Loaded test case: ${testId}`);
 
         } catch (error) {
           Logger.error(`Error loading test case ${yamlFile}: ${error}`);
@@ -318,19 +317,31 @@ class BenchmarkRunner {
     // Get AI response via OpenRouter
     const response = await client.generateResponse(modelConfig, testCase);
 
-    // Save response to JSON file
-    const jsonFilename = `${testCase.id}_${modelConfig.name}_${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
-    const jsonFilepath = path.join(this.jsonOutputDir, jsonFilename);
-    await fs.writeFile(jsonFilepath, response);
+    // Create timestamped subdirectory for this run if it doesn't exist
 
-    // Extract JSON from response (AI might add explanations)
-    const jsonResponse = this.extractJson(response);
+    await fs.mkdir(this.outputDir, { recursive: true });
+
+    // Create unique filename for this test/model pair
+    const filePrefix = `${testCase.id}_${modelConfig.name}`;
+    const responseFile = path.join(this.outputDir, `${filePrefix}-response.txt`);
+    const validationFile = path.join(this.outputDir, `${filePrefix}-validation.txt`);
+
+    // Save the raw response
+    await fs.writeFile(responseFile, response);
+
+    // Detect if response is XML or JSON and extract accordingly
+    const extractedContent = this.extractFhirContent(response);
+    const isXml = this.isXmlContent(extractedContent);
 
     // Validate FHIR using fhir-validator-wrapper
-    const validationResult = await this.validateFhirResource(jsonResponse, testCase.profile);
+    const validationResult = await this.validateFhirResource(extractedContent, testCase.profile, isXml);
+
+    // Format validation output as requested: [line,column] [severity] [message]
+    const validationOutput = this.formatValidationOutput(validationResult);
+    await fs.writeFile(validationFile, validationOutput);
 
     // Calculate scores
-    const scores = this.calculateScores(testCase, jsonResponse, validationResult);
+    const scores = this.calculateScores(testCase, extractedContent, validationResult, isXml);
     const totalScore = Object.entries(scores).reduce((total, [key, score]) => {
       const weight = testCase.scoring_criteria[key] || 0;
       return total + (score * weight);
@@ -350,11 +361,81 @@ class BenchmarkRunner {
     };
   }
 
-  private async validateFhirResource(fhirJson: string, profile?: string): Promise<FHIRValidationResult> {
+  private extractFhirContent(response: string): string {
+    // Try to find FHIR content in the response (JSON or XML)
+    response = response.trim();
+
+    // Look for JSON block markers
+    if (response.includes("```json")) {
+      const start = response.indexOf("```json") + 7;
+      const end = response.indexOf("```", start);
+      if (end !== -1) {
+        return response.substring(start, end).trim();
+      }
+    }
+
+    // Look for XML block markers
+    if (response.includes("```xml")) {
+      const start = response.indexOf("```xml") + 7;
+      const end = response.indexOf("```", start);
+      if (end !== -1) {
+        return response.substring(start, end).trim();
+      }
+    }
+
+    // Look for JSON object starting with {
+    const jsonStart = response.indexOf("{");
+    if (jsonStart !== -1) {
+      // Simple approach: find the matching closing brace
+      let braceCount = 0;
+      for (let i = jsonStart; i < response.length; i++) {
+        if (response[i] === "{") {
+          braceCount++;
+        } else if (response[i] === "}") {
+          braceCount--;
+          if (braceCount === 0) {
+            return response.substring(jsonStart, i + 1);
+          }
+        }
+      }
+    }
+
+    // Look for XML starting with < (could be FHIR resource)
+    const xmlStart = response.indexOf("<");
+    if (xmlStart !== -1) {
+      // Look for closing tag or end of content
+      const possibleXml = response.substring(xmlStart);
+      // Basic check if this looks like FHIR XML
+      if (possibleXml.includes("xmlns") || possibleXml.includes("resourceType")) {
+        return possibleXml.trim();
+      }
+    }
+
+    // If no structured content found, return the original response
+    return response;
+  }
+
+  private isXmlContent(content: string): boolean {
+    const trimmed = content.trim();
+    return trimmed.startsWith("<") && (trimmed.includes("xmlns") || trimmed.includes("</"));
+  }
+
+  private async validateFhirResource(fhirContent: string, profile?: string, isXml: boolean = false): Promise<FHIRValidationResult> {
     try {
-      // Parse JSON to ensure it's valid and get resource type
-      const resource = JSON.parse(fhirJson);
-      const resourceType = resource?.resourceType || 'unknown';
+      // Parse content to get resource type
+      let resourceType = 'unknown';
+
+      if (isXml) {
+        // Extract resource type from XML
+        const resourceTypeMatch = fhirContent.match(/<(\w+)[^>]*>/);
+        if (resourceTypeMatch) {
+          resourceType = resourceTypeMatch[1];
+        }
+      } else {
+        // Parse JSON to get resource type
+        const resource = JSON.parse(fhirContent);
+        resourceType = resource?.resourceType || 'unknown';
+      }
 
       // Build validation options for the fhir-validator-wrapper
       const validationOptions: any = {
@@ -367,7 +448,7 @@ class BenchmarkRunner {
       }
 
       // Call the fhir-validator-wrapper's validate method
-      const operationOutcome = await this.validator.validate(fhirJson, validationOptions);
+      const operationOutcome = await this.validator.validate(fhirContent, validationOptions);
 
       // Process OperationOutcome to extract validation info
       const issues = operationOutcome?.issue || [];
@@ -395,7 +476,7 @@ class BenchmarkRunner {
       };
 
     } catch (e) {
-      if (e instanceof SyntaxError) {
+      if (e instanceof SyntaxError && !isXml) {
         return {
           valid: false,
           errors: [`Invalid JSON: ${e.message}`],
@@ -414,44 +495,60 @@ class BenchmarkRunner {
     }
   }
 
-  private extractJson(response: string): string {
-    // Try to find JSON in the response
-    response = response.trim();
+  private formatValidationOutput(validationResult: FHIRValidationResult): string {
+    const lines: string[] = [];
 
-    // Look for JSON block markers
-    if (response.includes("```json")) {
-      const start = response.indexOf("```json") + 7;
-      const end = response.indexOf("```", start);
-      if (end !== -1) {
-        return response.substring(start, end).trim();
-      }
-    }
+    // Add summary line
+    lines.push(`Validation Result: ${validationResult.valid ? 'VALID' : 'INVALID'}`);
+    lines.push(`Resource Type: ${validationResult.resource_type}`);
+    lines.push('');
 
-    // Look for JSON object starting with {
-    const start = response.indexOf("{");
-    if (start !== -1) {
-      // Simple approach: find the matching closing brace
-      let braceCount = 0;
-      for (let i = start; i < response.length; i++) {
-        if (response[i] === "{") {
-          braceCount++;
-        } else if (response[i] === "}") {
-          braceCount--;
-          if (braceCount === 0) {
-            return response.substring(start, i + 1);
+    // Format issues in requested format: [line,col] [severity] [location]: [message]
+    if (validationResult.issues && validationResult.issues.length > 0) {
+      for (const issue of validationResult.issues) {
+        // Extract line and column from FHIR extensions
+        let line = '?';
+        let column = '?';
+
+        if (issue.extension) {
+          for (const ext of issue.extension) {
+            if (ext.url === 'http://hl7.org/fhir/StructureDefinition/operationoutcome-issue-line') {
+              line = ext.valueInteger?.toString() || '?';
+            }
+            if (ext.url === 'http://hl7.org/fhir/StructureDefinition/operationoutcome-issue-col') {
+              column = ext.valueInteger?.toString() || '?';
+            }
           }
         }
+
+        const severity = issue.severity || 'unknown';
+        const location = issue.expression?.[0] || 'unknown';
+        const message = issue.diagnostics || issue.details?.text || 'Unknown issue';
+
+        lines.push(`[${line},${column}] [${severity}] [${location}]: ${message}`);
+      }
+    } else {
+      // Fallback to basic error/warning format if detailed issues not available
+      for (const error of validationResult.errors) {
+        lines.push(`[?,?] [error] [unknown]: ${error}`);
+      }
+      for (const warning of validationResult.warnings) {
+        lines.push(`[?,?] [warning] [unknown]: ${warning}`);
       }
     }
 
-    // If no JSON found, return the original response
-    return response;
+    if (lines.length === 3) { // Only header lines, no issues
+      lines.push('[?,?] [info] [unknown]: No validation issues found');
+    }
+
+    return lines.join('\n');
   }
 
   private calculateScores(
       testCase: TestCase,
       response: string,
-      validation: FHIRValidationResult
+      validation: FHIRValidationResult,
+      isXml: boolean = false
   ): Record<string, number> {
     const scores: Record<string, number> = {};
 
@@ -472,22 +569,37 @@ class BenchmarkRunner {
     const warningCount = validation.warnings.length;
     scores.error_severity = Math.max(0.0, 1.0 - (errorCount * 0.2 + warningCount * 0.1));
 
-    // Response completeness (basic heuristic based on JSON structure)
+    // Response completeness (adjusted for XML vs JSON)
     try {
-      const parsed = JSON.parse(response);
-      if (typeof parsed === 'object' && parsed !== null) {
-        // Score based on presence of key FHIR fields
-        const requiredFields = ['resourceType', 'id'];
-        const presentFields = requiredFields.filter(field => field in parsed).length;
-        const fieldScore = presentFields / requiredFields.length;
+      if (isXml) {
+        // For XML, check for basic FHIR structure
+        const hasResourceType = response.includes('<') && validation.resource_type !== 'unknown';
+        const hasId = response.includes('id=') || response.includes('<id');
+        const hasNamespace = response.includes('xmlns') || response.includes('http://hl7.org/fhir');
 
-        // Bonus for additional meaningful content
-        const totalFields = Object.keys(parsed).length;
-        const contentScore = Math.min(1.0, totalFields / 8.0); // Normalize to reasonable field count
+        let xmlScore = 0;
+        if (hasResourceType) xmlScore += 0.4;
+        if (hasId) xmlScore += 0.3;
+        if (hasNamespace) xmlScore += 0.3;
 
-        scores.completeness = (fieldScore + contentScore) / 2;
+        scores.completeness = Math.min(1.0, xmlScore);
       } else {
-        scores.completeness = 0.0;
+        // For JSON, use existing logic
+        const parsed = JSON.parse(response);
+        if (typeof parsed === 'object' && parsed !== null) {
+          // Score based on presence of key FHIR fields
+          const requiredFields = ['resourceType', 'id'];
+          const presentFields = requiredFields.filter(field => field in parsed).length;
+          const fieldScore = presentFields / requiredFields.length;
+
+          // Bonus for additional meaningful content
+          const totalFields = Object.keys(parsed).length;
+          const contentScore = Math.min(1.0, totalFields / 8.0); // Normalize to reasonable field count
+
+          scores.completeness = (fieldScore + contentScore) / 2;
+        } else {
+          scores.completeness = 0.0;
+        }
       }
     } catch {
       scores.completeness = 0.0;
@@ -497,25 +609,28 @@ class BenchmarkRunner {
   }
 
   private async generateReports(): Promise<void> {
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 15);
+    // Use the same timestamp that was set at the beginning of the benchmark run
+    await fs.mkdir(this.outputDir, { recursive: true });
 
-    // Save raw results as JSON
-    const jsonOutput = path.join(this.outputDir, `results_${timestamp}.json`);
+    // Save raw results as JSON in the timestamped directory
+    const jsonOutput = path.join(this.outputDir, `results.json`);
     await fs.writeFile(jsonOutput, JSON.stringify(this.results, null, 2));
 
     // Generate summary statistics
     const summary = this.generateSummary();
 
-    // Save summary
-    const summaryOutput = path.join(this.outputDir, `summary_${timestamp}.json`);
+    // Save summary in the timestamped directory
+    const summaryOutput = path.join(this.outputDir, `summary.json`);
     await fs.writeFile(summaryOutput, JSON.stringify(summary, null, 2));
 
-    // Generate HTML report
-    const htmlOutput = path.join(this.outputDir, "benchmark_report.html");
+    // Generate HTML report in the timestamped directory
+    const htmlOutput = path.join(this.outputDir, "report.html");
     await this.generateHtmlReport(htmlOutput, summary);
 
-    Logger.info(`Reports generated: ${htmlOutput}`);
+    Logger.info(`Reports generated in: ${this.outputDir}`);
+    Logger.info(`HTML report: ${htmlOutput}`);
     Logger.info(`Raw results: ${jsonOutput}`);
+    Logger.info(`Summary: ${summaryOutput}`);
   }
 
   private generateSummary(): Record<string, any> {
@@ -585,6 +700,7 @@ class BenchmarkRunner {
 <!DOCTYPE html>
 <html>
 <head>
+    <meta charset="UTF-8">
     <title>FHIR AI Benchmark Results</title>
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; 
